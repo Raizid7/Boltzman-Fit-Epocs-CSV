@@ -1,0 +1,333 @@
+import numpy as np
+import pandas as pd
+import tkinter as tk
+from tkinter import filedialog, messagebox
+from dataclasses import dataclass
+from scipy.optimize import curve_fit
+import matplotlib.pyplot as plt
+
+
+def boltzmann(x, max_out, x50, k):
+    """
+    3-parameter logistic (Boltzmann) function.
+
+    max_out : upper asymptote (maximum response)
+    x50     : stimulation intensity at half-max response
+    k       : slope factor (controls steepness)
+
+    Returns predicted amplitude at intensity x.
+    """
+    return max_out / (1.0 + np.exp(-(x - x50) / k))
+
+
+def peak_to_peak(y):
+    """
+    Compute peak-to-peak amplitude within a signal segment.
+    Ignores NaNs safely.
+    """
+    return float(np.nanmax(y) - np.nanmin(y))
+
+
+@dataclass
+class Settings:
+    """
+    Holds all user-adjustable parameters.
+    Centralizing them keeps GUI and analysis clean.
+    """
+
+    # --- stimulation schedule (manual intensity rule) ---
+    stim_start_mv: float = 0.2       # starting stimulation intensity
+    stim_step_mv: float = 0.3        # increment between intensity levels
+    sweeps_per_step: int = 3         # number of sweeps per intensity level
+
+    # --- timing (ms) relative to stim at t=0 ---
+    stim_time_ms: float = 0.0        # reference stim time
+
+    stim_start_ms: float = -5.0      # artifact window start
+    stim_stop_ms: float = 5.0       # artifact window stop
+
+    m_start_ms: float = 10.0        # M-wave window start
+    m_stop_ms: float = 25.0         # M-wave window stop
+
+    h_start_ms: float = 30.0        # H-reflex window start
+    h_stop_ms: float = 50.0         # H-reflex window stop
+
+    rms_start_ms: float = -90.0     # baseline RMS window start
+    rms_stop_ms: float = -10.0      # baseline RMS window stop
+
+    # --- optional small X jitter to avoid duplicate X fit issues ---
+    add_x_jitter: bool = True
+    x_jitter_sd_mv: float = 0.01    # SD of jitter (must be small vs step size)
+
+
+def build_x_manual(n_sweeps, stim_start_mv, stim_step_mv, sweeps_per_step):
+    """
+    Construct stimulation intensity vector manually.
+
+    Example:
+    If sweeps_per_step = 3:
+    sweeps 0–2  -> level 0
+    sweeps 3–5  -> level 1
+    etc.
+    """
+    if sweeps_per_step <= 0:
+        raise ValueError("sweeps_per_step must be > 0.")
+
+    idx = np.arange(n_sweeps)
+    level = idx // int(sweeps_per_step)
+    return stim_start_mv + stim_step_mv * level
+
+
+def masks_from_ms(t, stim_time_ms, start_ms, stop_ms):
+    """
+    Create a boolean mask for a time window defined in milliseconds.
+
+    t              : time array in seconds
+    stim_time_ms   : reference stimulation time
+    start_ms/stop_ms : window boundaries in ms relative to stim
+    """
+    # Align time vector to stimulation time
+    tr = t - (stim_time_ms / 1000.0)
+
+    # Convert ms to seconds
+    s0 = start_ms / 1000.0
+    s1 = stop_ms / 1000.0
+
+    return (tr >= s0) & (tr <= s1)
+
+
+def run_fit(csv_path: str, s: Settings):
+    """
+    Core analysis pipeline:
+    - Load CSV
+    - Extract M/H peak-to-peak amplitudes
+    - Build stimulation vector
+    - Fit Boltzmann curve to M-wave
+    - Plot results
+    """
+
+    # Expect headerless numeric CSV:
+    # column 0 = time (seconds)
+    # columns 1..N = sweep signals
+    df = pd.read_csv(csv_path, header=None)
+    arr = df.to_numpy(dtype=float)
+
+    if arr.shape[1] < 3:
+        raise ValueError("CSV must be: time column + at least 2 sweep columns.")
+
+    t = arr[:, 0]
+    sweeps = arr[:, 1:]
+    n_samples, n_sweeps = sweeps.shape
+
+    # Estimate sampling frequency using median dt (robust to small jitter)
+    dt = float(np.median(np.diff(t)))
+    if not np.isfinite(dt) or dt <= 0:
+        raise ValueError("Time column is invalid (dt<=0).")
+    sf = 1.0 / dt
+
+    # Create masks for each analysis window
+    stim_mask = masks_from_ms(t, s.stim_time_ms, s.stim_start_ms, s.stim_stop_ms)
+    m_mask = masks_from_ms(t, s.stim_time_ms, s.m_start_ms, s.m_stop_ms)
+    h_mask = masks_from_ms(t, s.stim_time_ms, s.h_start_ms, s.h_stop_ms)
+    rms_mask = masks_from_ms(t, s.stim_time_ms, s.rms_start_ms, s.rms_stop_ms)
+
+    # Ensure windows contain enough samples
+    for name, m in [("Stim", stim_mask), ("M", m_mask), ("H", h_mask), ("RMS", rms_mask)]:
+        if m.sum() < 3:
+            raise ValueError(f"{name} window has too few samples.")
+
+    # Build stimulation intensity vector
+    X = build_x_manual(n_sweeps, s.stim_start_mv, s.stim_step_mv, s.sweeps_per_step)
+
+    # Optional jitter to avoid identical X values in curve fitting
+    X_fit = X.copy()
+    if s.add_x_jitter:
+        rng = np.random.default_rng(0)  # deterministic jitter
+        X_fit = X_fit + rng.normal(0.0, s.x_jitter_sd_mv, size=X_fit.shape)
+
+    # Compute peak-to-peak M and H amplitudes
+    Mampx = np.array([peak_to_peak(sweeps[m_mask, i]) for i in range(n_sweeps)], dtype=float)
+    Hampx = np.array([peak_to_peak(sweeps[h_mask, i]) for i in range(n_sweeps)], dtype=float)
+
+    # Scale to mV (matches original MATLAB behavior)
+    scale_to_mV = 1000.0
+    Mamp = Mampx * scale_to_mV
+    Hamp = Hampx * scale_to_mV
+
+    # Keep only finite values for fitting
+    ok = np.isfinite(X_fit) & np.isfinite(Mamp)
+    Xv = X_fit[ok]
+    Yv = Mamp[ok]
+
+    if Xv.size < 6:
+        raise ValueError("Not enough valid sweeps for fit.")
+
+    # ---- Initial parameter guesses ----
+    max0 = float(np.nanmax(Yv))             # upper asymptote guess
+    x50_0 = float(np.nanmedian(Xv))         # midpoint guess
+    x_range = float(np.nanmax(Xv) - np.nanmin(Xv))
+    k0 = max(x_range / 10.0, 1e-6)          # slope guess
+
+    p0 = [max0, x50_0, k0]
+
+    # ---- Parameter bounds ----
+    pad = 0.25 * (x_range + 1e-9)
+    lower = [0.0, float(np.nanmin(Xv) - pad), 1e-9]
+    upper = [np.inf, float(np.nanmax(Xv) + pad), np.inf]
+
+    # ---- Nonlinear least-squares fit ----
+    popt, pcov = curve_fit(
+        boltzmann,
+        Xv,
+        Yv,
+        p0=p0,
+        bounds=(lower, upper),
+        maxfev=200000
+    )
+
+    # Create smooth curve for plotting
+    x_grid = np.linspace(float(np.nanmin(Xv)), float(np.nanmax(Xv)), 600)
+    y_grid = boltzmann(x_grid, *popt)
+
+    # ---- Plot results ----
+    plt.figure()
+    plt.plot(x_grid, y_grid, "-", linewidth=1, label="Boltz fit (M)")
+    plt.plot(X, Mamp, "o", label="M-wave (p-p)")
+    plt.plot(X, Hamp, "o", label="H-reflex (p-p)")
+    plt.xlabel("Stimulation intensity (mV)")
+    plt.ylabel("Amplitude (scaled)")
+    plt.title(f"{csv_path}\nSF={sf:.1f} Hz | sweeps={n_sweeps}")
+    plt.legend()
+    plt.tight_layout()
+    plt.show()
+
+    return sf, popt
+
+
+def gui():
+    # Create main Tkinter window
+    root = tk.Tk()
+    root.title("Boltzmann Fit (manual stim schedule)")
+
+    # Default settings object
+    s = Settings()
+
+    # ---- Tkinter variables (hold GUI state) ----
+    file_var = tk.StringVar(value="")
+
+    stim_start_var = tk.StringVar(value=str(s.stim_start_mv))
+    stim_step_var = tk.StringVar(value=str(s.stim_step_mv))
+    sweeps_per_var = tk.StringVar(value=str(s.sweeps_per_step))
+
+    stim_time_var = tk.StringVar(value=str(s.stim_time_ms))
+    stim_w1 = tk.StringVar(value=str(s.stim_start_ms))
+    stim_w2 = tk.StringVar(value=str(s.stim_stop_ms))
+    m_w1 = tk.StringVar(value=str(s.m_start_ms))
+    m_w2 = tk.StringVar(value=str(s.m_stop_ms))
+    h_w1 = tk.StringVar(value=str(s.h_start_ms))
+    h_w2 = tk.StringVar(value=str(s.h_stop_ms))
+    rms_w1 = tk.StringVar(value=str(s.rms_start_ms))
+    rms_w2 = tk.StringVar(value=str(s.rms_stop_ms))
+
+    jitter_on = tk.IntVar(value=1 if s.add_x_jitter else 0)
+    jitter_sd = tk.StringVar(value=str(s.x_jitter_sd_mv))
+
+    # ---- File browser ----
+    def browse():
+        p = filedialog.askopenfilename(
+            title="Select CSV",
+            filetypes=[("CSV files", "*.csv"), ("All files", "*.*")]
+        )
+        if p:
+            file_var.set(p)
+
+    # ---- Run button callback ----
+    def run():
+        path = file_var.get().strip()
+        if not path:
+            messagebox.showerror("Error", "Pick a CSV first.")
+            return
+
+        # Parse GUI inputs into a new Settings object
+        try:
+            settings = Settings(
+                stim_start_mv=float(stim_start_var.get()),
+                stim_step_mv=float(stim_step_var.get()),
+                sweeps_per_step=int(float(sweeps_per_var.get())),
+                stim_time_ms=float(stim_time_var.get()),
+                stim_start_ms=float(stim_w1.get()),
+                stim_stop_ms=float(stim_w2.get()),
+                m_start_ms=float(m_w1.get()),
+                m_stop_ms=float(m_w2.get()),
+                h_start_ms=float(h_w1.get()),
+                h_stop_ms=float(h_w2.get()),
+                rms_start_ms=float(rms_w1.get()),
+                rms_stop_ms=float(rms_w2.get()),
+                add_x_jitter=bool(jitter_on.get()),
+                x_jitter_sd_mv=float(jitter_sd.get()),
+            )
+        except Exception as e:
+            messagebox.showerror("Error", f"Bad input: {e}")
+            return
+
+        # Execute analysis
+        try:
+            sf, beta = run_fit(path, settings)
+
+            # Display fitted parameters
+            messagebox.showinfo(
+                "Fit result",
+                f"SF = {sf:.2f} Hz\n\nbeta:\n"
+                f"  max_out = {beta[0]:.6g}\n"
+                f"  x50     = {beta[1]:.6g}\n"
+                f"  k       = {beta[2]:.6g}\n"
+            )
+        except Exception as e:
+            messagebox.showerror("Error", str(e))
+
+    # ---- Layout ----
+    frm = tk.Frame(root, padx=10, pady=10)
+    frm.pack(fill="both", expand=True)
+
+    tk.Label(frm, text="CSV").grid(row=0, column=0, sticky="w")
+    tk.Entry(frm, textvariable=file_var, width=60).grid(row=0, column=1, sticky="we")
+    tk.Button(frm, text="Browse…", command=browse).grid(row=0, column=2, padx=5)
+
+    tk.Label(frm, text="Stim schedule").grid(row=1, column=0, sticky="w")
+    tk.Label(frm, text="start (mV)").grid(row=2, column=0, sticky="w")
+    tk.Entry(frm, textvariable=stim_start_var, width=10).grid(row=2, column=1, sticky="w")
+    tk.Label(frm, text="step (mV)").grid(row=2, column=2, sticky="w")
+    tk.Entry(frm, textvariable=stim_step_var, width=10).grid(row=2, column=3, sticky="w")
+    tk.Label(frm, text="sweeps/step").grid(row=2, column=4, sticky="w")
+    tk.Entry(frm, textvariable=sweeps_per_var, width=10).grid(row=2, column=5, sticky="w")
+
+    tk.Label(frm, text="Stim time (ms)").grid(row=3, column=0, sticky="w")
+    tk.Entry(frm, textvariable=stim_time_var, width=10).grid(row=3, column=1, sticky="w")
+
+    tk.Label(frm, text="Windows (ms)").grid(row=4, column=0, sticky="w")
+    r = 5
+    for name, a, b in [
+        ("Stim", stim_w1, stim_w2),
+        ("M", m_w1, m_w2),
+        ("H", h_w1, h_w2),
+        ("RMS", rms_w1, rms_w2),
+    ]:
+        tk.Label(frm, text=name).grid(row=r, column=0, sticky="w")
+        tk.Entry(frm, textvariable=a, width=10).grid(row=r, column=1, sticky="w")
+        tk.Entry(frm, textvariable=b, width=10).grid(row=r, column=2, sticky="w")
+        r += 1
+
+    tk.Checkbutton(frm, text="Add tiny X jitter", variable=jitter_on).grid(row=r, column=0, sticky="w")
+    tk.Label(frm, text="jitter sd (mV)").grid(row=r, column=1, sticky="e")
+    tk.Entry(frm, textvariable=jitter_sd, width=10).grid(row=r, column=2, sticky="w")
+    r += 1
+
+    tk.Button(frm, text="Run fit", command=run, height=2).grid(row=r, column=0, columnspan=6, sticky="we", pady=10)
+
+    frm.columnconfigure(1, weight=1)
+    root.mainloop()
+
+
+
+if __name__ == "__main__":
+    gui()
