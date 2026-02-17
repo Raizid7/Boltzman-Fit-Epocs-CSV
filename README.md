@@ -156,8 +156,6 @@ scale_to_mV = 1.0
 ```
 
 
-```
-
 ### Fit fails
 
 Check:
@@ -178,8 +176,3 @@ Check:
 - No normalization applied  
 - Deterministic small X jitter can be enabled to avoid duplicate intensity issues  
 
----
-
-## License
-
-Free for research and academic use.
