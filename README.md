@@ -37,6 +37,28 @@ Tkinter is included with standard Python installations on Windows.
 
 ---
 
+
+## Build Windows Executable
+
+Install PyInstaller:
+
+```bash
+python -m pip install pyinstaller
+```
+
+Create executable:
+
+```bash
+python -m PyInstaller --onefile --windowed Boltzmann.py
+```
+
+Output:
+
+```
+dist/Boltzmann.exe
+```
+
+---
 ## Expected CSV Format
 
 The script expects a **headerless numeric CSV**:
