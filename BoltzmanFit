@@ -57,6 +57,7 @@ class Settings:
 
     # --- MATLAB-like extras ---
     show_raw_check_plot: bool = True
+    show_h_poly_fit_plot: bool = True
     write_results_txt: bool = True
     results_txt_name: str = "InOutResults.txt"
     save_summary_csv: bool = True
@@ -124,6 +125,64 @@ def _cov_and_ci_from_jacobian(res, alpha=0.05):
     return cov, ci
 
 
+
+def fit_h_reflex_poly3(x, y, normalize=True):
+    """MATLAB-like Poly3 fit for H-reflex (optionally normalized).
+
+    Returns:
+        dict with keys:
+          - coeffs_z: poly coefficients highest->lowest in normalized space (z)
+          - mu, sigma: normalization parameters (if normalize else 0,1)
+          - r2, rmse: goodness-of-fit metrics on the input points
+          - x_grid, y_grid: smooth curve for plotting
+          - y_hat: fitted values on x
+    """
+    x = np.asarray(x, dtype=float)
+    y = np.asarray(y, dtype=float)
+    ok = np.isfinite(x) & np.isfinite(y)
+    x = x[ok]
+    y = y[ok]
+    if x.size < 4:
+        raise ValueError("Not enough points for Poly3 fit (need >= 4).")
+
+    if normalize:
+        mu = float(np.mean(x))
+        sigma = float(np.std(x, ddof=0))
+        if not np.isfinite(sigma) or sigma == 0.0:
+            sigma = 1.0
+        z = (x - mu) / sigma
+    else:
+        mu, sigma = 0.0, 1.0
+        z = x
+
+    coeffs_z = np.polyfit(z, y, deg=3)
+    p = np.poly1d(coeffs_z)
+    y_hat = p(z)
+
+    ss_res = float(np.sum((y - y_hat) ** 2))
+    ss_tot = float(np.sum((y - float(np.mean(y))) ** 2))
+    r2 = float("nan") if ss_tot == 0.0 else 1.0 - ss_res / ss_tot
+    rmse = float(np.sqrt(ss_res / max(1, y.size)))
+
+    # Smooth curve
+    x_grid = np.linspace(float(np.min(x)), float(np.max(x)), 400)
+    z_grid = (x_grid - mu) / sigma if normalize else x_grid
+    y_grid = p(z_grid)
+
+    return {
+        "coeffs_z": coeffs_z,
+        "mu": mu,
+        "sigma": sigma,
+        "r2": r2,
+        "rmse": rmse,
+        "x_grid": x_grid,
+        "y_grid": y_grid,
+        "y_hat": y_hat,
+        "x_data": x,
+        "y_data": y,
+    }
+
+
 def run_fit(csv_path: str, s: Settings):
     # Expect headerless numeric CSV:
     # column 0 = time (seconds)
@@ -171,6 +230,26 @@ def run_fit(csv_path: str, s: Settings):
     Mamp = Mampx * scale_to_mV
     Hamp = Hampx * scale_to_mV
     EMGrms = EMGrmsx * scale_to_mV
+
+    # --- H-Reflex Poly3 fit (MATLAB: fit(..., 'Poly3', 'Normalize','on')) ---
+    h_poly = None
+    if s.show_h_poly_fit_plot:
+        try:
+            h_poly = fit_h_reflex_poly3(X, Hamp, normalize=True)
+
+            plt.figure()
+            plt.plot(h_poly["x_grid"], h_poly["y_grid"], "-", linewidth=1, label="Poly3 fit (normalized)")
+            plt.plot(h_poly["x_data"], h_poly["y_data"], "o", label="Hamp vs. X")
+            plt.xlabel("Stimulation intensity (mV)")
+            plt.ylabel("H amplitude (mV)")
+            plt.title(f"H-Reflex (Poly3) | R²={h_poly['r2']:.3f} | RMSE={h_poly['rmse']:.3g}")
+            plt.grid(True)
+            plt.legend(loc="upper right")
+            plt.tight_layout()
+        except Exception as _e:
+            # Keep main workflow running even if the polynomial fit fails.
+            h_poly = None
+
 
     # Fit only finite points
     ok = np.isfinite(X_fit) & np.isfinite(Mamp)
@@ -258,6 +337,7 @@ def run_fit(csv_path: str, s: Settings):
         "jacobian": J,
         "pcov": pcov,
         "ci": ci,
+        "h_poly": h_poly,
         "xstim": x_grid,
         "fit": y_grid,
         "txt_path": txt_path if s.write_results_txt else None,
@@ -300,6 +380,7 @@ def gui():
     jitter_sd = tk.StringVar(value=str(s.x_jitter_sd_mv))
 
     raw_plot_on = tk.IntVar(value=1 if s.show_raw_check_plot else 0)
+    h_poly_on = tk.IntVar(value=1 if s.show_h_poly_fit_plot else 0)
     write_txt_on = tk.IntVar(value=1 if s.write_results_txt else 0)
     save_csv_on = tk.IntVar(value=1 if s.save_summary_csv else 0)
 
@@ -334,6 +415,7 @@ def gui():
                 add_x_jitter=bool(jitter_on.get()),
                 x_jitter_sd_mv=float(jitter_sd.get()),
                 show_raw_check_plot=bool(raw_plot_on.get()),
+                show_h_poly_fit_plot=bool(h_poly_on.get()),
                 write_results_txt=bool(write_txt_on.get()),
                 save_summary_csv=bool(save_csv_on.get()),
             )
@@ -411,8 +493,9 @@ def gui():
     r += 1
 
     tk.Checkbutton(frm, text="Show raw check plot", variable=raw_plot_on).grid(row=r, column=0, sticky="w")
-    tk.Checkbutton(frm, text="Append InOutResults.txt", variable=write_txt_on).grid(row=r, column=1, sticky="w")
-    tk.Checkbutton(frm, text="Save per-sweep summary CSV", variable=save_csv_on).grid(row=r, column=2, sticky="w")
+    tk.Checkbutton(frm, text="Show H-Reflex Poly3 plot", variable=h_poly_on).grid(row=r, column=1, sticky="w")
+    tk.Checkbutton(frm, text="Append InOutResults.txt", variable=write_txt_on).grid(row=r, column=2, sticky="w")
+    tk.Checkbutton(frm, text="Save per-sweep summary CSV", variable=save_csv_on).grid(row=r, column=3, sticky="w")
     r += 1
 
     tk.Button(frm, text="Run fit", command=run, height=2).grid(row=r, column=0, columnspan=6, sticky="we", pady=10)
