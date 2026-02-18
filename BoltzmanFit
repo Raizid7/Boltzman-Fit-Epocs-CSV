@@ -29,6 +29,90 @@ def rms_nan(y):
     return float(np.sqrt(np.mean(y * y)))
 
 
+def local_extrema(y):
+    """Return indices of local maxima and minima (on the given 1D array)."""
+    y = np.asarray(y, dtype=float)
+    if y.size < 3:
+        return np.array([], dtype=int), np.array([], dtype=int)
+
+    dy = np.diff(y)
+    s = np.sign(dy)
+    ds = np.diff(s)
+
+    # max: sign goes + to -
+    max_idx = np.where(ds < 0)[0] + 1
+    # min: sign goes - to +
+    min_idx = np.where(ds > 0)[0] + 1
+    return max_idx.astype(int), min_idx.astype(int)
+
+
+def m_amp_p1n1_in_window(t, y, stim_time_ms, m_mask, h_start_ms, opposite_max_ms=12.0):
+    """
+    M amplitude as first peak to first opposite peak (P1->N1 or N1->P1) inside the M window.
+
+    - Uses the first local extremum within the M window.
+    - Then searches for the first opposite extremum after it, but only:
+        * up to (first_peak_time + opposite_max_ms)
+        * and before the H search starts (h_start_ms)
+
+    Returns NaN if not detectable.
+    """
+    t = np.asarray(t, dtype=float)
+    y = np.asarray(y, dtype=float)
+    idx = np.flatnonzero(m_mask)
+    if idx.size < 5:
+        return float("nan")
+
+    t_seg = t[idx]
+    y_seg = y[idx]
+
+    # Time in ms relative to stim
+    tr_seg = (t_seg - (stim_time_ms / 1000.0)) * 1000.0
+
+    max_idx, min_idx = local_extrema(y_seg)
+    if max_idx.size == 0 and min_idx.size == 0:
+        return float("nan")
+
+    # First extremum in time
+    if max_idx.size and min_idx.size:
+        first = int(max_idx[0] if max_idx[0] < min_idx[0] else min_idx[0])
+    elif max_idx.size:
+        first = int(max_idx[0])
+    else:
+        first = int(min_idx[0])
+
+    first_is_max = np.any(max_idx == first)
+
+    # Limit opposite-peak search
+    t_first = float(tr_seg[first])
+    t_limit = min(float(h_start_ms), t_first + float(opposite_max_ms))
+    after = (np.arange(y_seg.size) > first) & (tr_seg <= t_limit)
+
+    cand_after = np.flatnonzero(after)
+    if cand_after.size < 3:
+        return float("nan")
+
+    if first_is_max:
+        opp = np.intersect1d(min_idx, cand_after, assume_unique=False)
+        if opp.size == 0:
+            # fallback: absolute minimum after first in allowed range
+            rel = y_seg[cand_after]
+            opp_i = int(cand_after[int(np.argmin(rel))])
+        else:
+            opp_i = int(opp[0])
+    else:
+        opp = np.intersect1d(max_idx, cand_after, assume_unique=False)
+        if opp.size == 0:
+            # fallback: absolute maximum after first in allowed range
+            rel = y_seg[cand_after]
+            opp_i = int(cand_after[int(np.argmax(rel))])
+        else:
+            opp_i = int(opp[0])
+
+    amp = y_seg[first] - y_seg[opp_i]
+    return float(abs(amp))
+
+
 @dataclass
 class Settings:
     # --- stimulation schedule (manual intensity rule) ---
@@ -51,29 +135,18 @@ class Settings:
     rms_start_ms: float = -90.0
     rms_stop_ms: float = -10.0
 
-    # --- auto-detect M/H windows ---
-    auto_windows: bool = False
-    # Search bands (ms) relative to stim; tune to your setup if needed
-    m_search_start_ms: float = 5.0
-    m_search_stop_ms: float = 30.0
-    h_search_start_ms: float = 35.0
-    h_search_stop_ms: float = 80.0
-    # Sliding window length used to score candidate segments
-    auto_win_len_ms: float = 12.0
-    # Ignore a small margin at band edges
-    auto_guard_ms: float = 2.0
+    # --- M amplitude method ---
+    # If False: classic peak-to-peak within fixed M window.
+    # If True : first peak-to-first opposite peak (P1->N1 / N1->P1) within the M window,
+    #          which is more robust when later oscillations overlap the M window.
+    use_m_p1n1: bool = False
 
-
-
-    # Prefer the first strong response inside the M-band (helps when two responses exist)
-    auto_m_first_fraction: float = 0.70  # pick earliest window with score >= fraction*best_in_band
-    auto_noise_mult: float = 6.0         # minimum score must exceed noise_rms*mult
+    # Max time (ms) after the first M peak to look for the opposite peak (only used if use_m_p1n1=True)
+    m_opposite_max_ms: float = 12.0
 
     # --- optional small X jitter to avoid duplicate X fit issues ---
     add_x_jitter: bool = True
-    # MATLAB script adds randn(N,1)*0.1 to X *after* building StimAmpx.
-    # Keep the same default so duplicate X values separate in the fit plot.
-    x_jitter_sd_mv: float = 0.1
+    x_jitter_sd_mv: float = 0.01
 
     # --- MATLAB-like extras ---
     show_raw_check_plot: bool = True
@@ -101,108 +174,6 @@ def masks_from_ms(t, stim_time_ms, start_ms, stop_ms):
     s1 = stop_ms / 1000.0
     return (tr >= s0) & (tr <= s1)
 
-
-
-def _moving_mean(x, n):
-    x = np.asarray(x, dtype=float)
-    if n is None or int(n) <= 1:
-        return x
-    n = int(n)
-    k = np.ones(n, dtype=float) / float(n)
-    return np.convolve(x, k, mode="same")
-
-
-def detect_m_h_windows_ms(t, sweeps, s: Settings):
-    """Auto-detect M and H analysis windows.
-
-    Uses a robust reference trace (median across sweeps after baseline removal),
-    then selects the highest peak-to-peak segment within user-defined latency bands.
-
-    Returns: (m_start_ms, m_stop_ms, h_start_ms, h_stop_ms)
-    """
-    t = np.asarray(t, dtype=float)
-    sweeps = np.asarray(sweeps, dtype=float)
-
-    dt = float(np.median(np.diff(t)))
-    if not np.isfinite(dt) or dt <= 0:
-        raise ValueError("Time column is invalid (dt<=0).")
-    sf = 1.0 / dt
-
-    # Baseline subtract each sweep using the RMS (pre-stim) window
-    rms_mask = masks_from_ms(t, s.stim_time_ms, s.rms_start_ms, s.rms_stop_ms)
-    if rms_mask.sum() < 3:
-        raise ValueError("RMS window has too few samples for auto-detection baseline.")
-
-    base = np.nanmean(sweeps[rms_mask, :], axis=0)  # per-sweep baseline
-    sweeps0 = sweeps - base  # broadcast
-
-    # Robust reference (median reduces outlier artifacts)
-    ref = np.nanmedian(sweeps0, axis=1)
-
-
-    # Noise estimate from pre-stim window on the reference trace
-    noise_rms = rms_nan(ref[rms_mask])
-    win_len = max(5, int(round((float(s.auto_win_len_ms) / 1000.0) * sf)))
-    guard = max(0, int(round((float(s.auto_guard_ms) / 1000.0) * sf)))
-
-    def best_window(search_start_ms, search_stop_ms, *, prefer_first=False, first_fraction=0.7, min_score=0.0):
-        band_mask = masks_from_ms(t, s.stim_time_ms, search_start_ms, search_stop_ms)
-        idx = np.where(band_mask)[0]
-        if idx.size < win_len + 3:
-            raise ValueError("Auto window search band is too small.")
-
-        i_lo = int(idx[0] + guard)
-        i_hi = int(idx[-1] - win_len - guard)
-        if i_hi <= i_lo:
-            raise ValueError("Auto window search band is too small after guard.")
-
-        # Score candidate windows by peak-to-peak on the reference trace
-        scores = np.full(i_hi - i_lo + 1, np.nan, dtype=float)
-        for k, i0 in enumerate(range(i_lo, i_hi + 1)):
-            seg = ref[i0 : i0 + win_len]
-            scores[k] = float(np.nanmax(seg) - np.nanmin(seg))
-
-        # Best in band (used both for default and for 'prefer_first' logic)
-        finite = scores[np.isfinite(scores)]
-        if finite.size == 0:
-            raise ValueError("Auto window detection failed (no finite scores).")
-        best_score = float(np.nanmax(finite))
-
-        # Choose index
-        chosen_i = None
-        if prefer_first:
-            thresh = max(float(min_score), float(first_fraction) * best_score)
-            for k, i0 in enumerate(range(i_lo, i_hi + 1)):
-                sc = scores[k]
-                if np.isfinite(sc) and sc >= thresh:
-                    chosen_i = i0
-                    break
-            # If nothing crosses threshold, fall back to the best window
-            if chosen_i is None:
-                chosen_i = int(i_lo + int(np.nanargmax(scores)))
-        else:
-            chosen_i = int(i_lo + int(np.nanargmax(scores)))
-
-        # Convert sample window to ms relative to stim
-        tr = t - (s.stim_time_ms / 1000.0)
-        start_ms = float(tr[chosen_i] * 1000.0)
-        stop_ms = float(tr[chosen_i + win_len - 1] * 1000.0)
-        return start_ms, stop_ms
-
-    m0, m1 = best_window(
-        s.m_search_start_ms,
-        s.m_search_stop_ms,
-        prefer_first=True,
-        first_fraction=float(s.auto_m_first_fraction),
-        min_score=float(noise_rms) * float(s.auto_noise_mult),
-    )
-    h0, h1 = best_window(
-        s.h_search_start_ms,
-        s.h_search_stop_ms,
-        prefer_first=False,
-        min_score=float(noise_rms) * float(s.auto_noise_mult),
-    )
-    return m0, m1, h0, h1
 
 def _fit_boltzmann_least_squares(x, y, p0, bounds):
     lower, upper = bounds
@@ -249,7 +220,7 @@ def _cov_and_ci_from_jacobian(res, alpha=0.05):
 
 
 def fit_h_reflex_poly3(x, y, normalize=True):
-    """MATLAB-like Poly3 fit for H-reflex (optionally normalized).
+    """Poly3 fit for H-reflex (optionally normalized).
 
     Returns:
         dict with keys:
@@ -324,11 +295,6 @@ def run_fit(csv_path: str, s: Settings):
         raise ValueError("Time column is invalid (dt<=0).")
     sf = 1.0 / dt
 
-    # Optionally auto-detect M/H windows from the data
-    if getattr(s, 'auto_windows', False):
-        m0, m1, h0, h1 = detect_m_h_windows_ms(t, sweeps, s)
-        s = Settings(**{**s.__dict__, 'm_start_ms': m0, 'm_stop_ms': m1, 'h_start_ms': h0, 'h_stop_ms': h1})
-
     stim_mask = masks_from_ms(t, s.stim_time_ms, s.stim_start_ms, s.stim_stop_ms)
     m_mask = masks_from_ms(t, s.stim_time_ms, s.m_start_ms, s.m_stop_ms)
     h_mask = masks_from_ms(t, s.stim_time_ms, s.h_start_ms, s.h_stop_ms)
@@ -339,30 +305,52 @@ def run_fit(csv_path: str, s: Settings):
             raise ValueError(f"{name} window has too few samples.")
 
     # Stimulation intensities
-    # X_raw is the "clean" stimulation axis (MATLAB: StimAmpx)
-    X_raw = build_x_manual(n_sweeps, s.stim_start_mv, s.stim_step_mv, s.sweeps_per_step)
+    X = build_x_manual(n_sweeps, s.stim_start_mv, s.stim_step_mv, s.sweeps_per_step)
 
-    # X_fit is used for fitting AND for the fit plot points (MATLAB: X = StimAmpx + randn()*0.1)
-    X_fit = X_raw.copy()
+    # Optional jitter (deterministic)
+    X_fit = X.copy()
     if s.add_x_jitter:
-        X_fit = X_fit + np.random.randn(*X_fit.shape) * float(s.x_jitter_sd_mv)
+        rng = np.random.default_rng(0)
+        X_fit = X_fit + rng.normal(0.0, s.x_jitter_sd_mv, size=X_fit.shape)
 
     # Extract per-sweep metrics
-    Mampx = np.array([peak_to_peak(sweeps[m_mask, i]) for i in range(n_sweeps)], dtype=float)
-    Hampx = np.array([peak_to_peak(sweeps[h_mask, i]) for i in range(n_sweeps)], dtype=float)
-    EMGrmsx = np.array([rms_nan(sweeps[rms_mask, i]) for i in range(n_sweeps)], dtype=float)
+    Mampx = np.full(n_sweeps, np.nan, dtype=float)
+    Hampx = np.full(n_sweeps, np.nan, dtype=float)
+    EMGrmsx = np.full(n_sweeps, np.nan, dtype=float)
 
-    # Match MATLAB scaling to mV
+    for i in range(n_sweeps):
+        y = sweeps[:, i]
+
+        # Baseline RMS always from the fixed RMS window
+        EMGrmsx[i] = rms_nan(y[rms_mask])
+
+        # H stays classic peak-to-peak in the fixed H window
+        Hampx[i] = peak_to_peak(y[h_mask])
+
+        # M: choose method
+        if s.use_m_p1n1:
+            Mampx[i] = m_amp_p1n1_in_window(
+                t=t,
+                y=y,
+                stim_time_ms=s.stim_time_ms,
+                m_mask=m_mask,
+                h_start_ms=s.h_start_ms,
+                opposite_max_ms=s.m_opposite_max_ms,
+            )
+        else:
+            Mampx[i] = peak_to_peak(y[m_mask])
+
+    # scaling to mV
     scale_to_mV = 1000.0
     Mamp = Mampx * scale_to_mV
     Hamp = Hampx * scale_to_mV
     EMGrms = EMGrmsx * scale_to_mV
 
-    # --- H-Reflex Poly3 fit (MATLAB: fit(..., 'Poly3', 'Normalize','on')) ---
+    # --- H-Reflex Poly3 fit (..., 'Poly3', 'Normalize','on') ---
     h_poly = None
     if s.show_h_poly_fit_plot:
         try:
-            h_poly = fit_h_reflex_poly3(X_raw, Hamp, normalize=True)
+            h_poly = fit_h_reflex_poly3(X, Hamp, normalize=True)
 
             plt.figure()
             plt.plot(h_poly["x_grid"], h_poly["y_grid"], "-", linewidth=1, label="Poly3 fit (normalized)")
@@ -412,8 +400,8 @@ def run_fit(csv_path: str, s: Settings):
     # --- Raw check plot (Hamp & Mamp vs stim) ---
     if s.show_raw_check_plot:
         plt.figure()
-        plt.plot(X_raw, Hamp, "o", label="H-reflex (p-p)")
-        plt.plot(X_raw, Mamp, "o", label="M-wave (p-p)")
+        plt.plot(X, Hamp, "o", label="H-reflex (p-p)")
+        plt.plot(X, Mamp, "o", label=("M-wave (P1→N1)" if s.use_m_p1n1 else "M-wave (p-p)"))
         plt.xlabel("Stimulation intensity (mV)")
         plt.ylabel("Amplitude (mV)")
         plt.title("Raw check: H and M vs stimulation")
@@ -423,9 +411,8 @@ def run_fit(csv_path: str, s: Settings):
     # --- Fit plot ---
     plt.figure()
     plt.plot(x_grid, y_grid, "-", linewidth=1, label="Boltz fit (M)")
-    # Use jittered X like MATLAB so duplicates separate in this plot.
-    plt.plot(X_fit, Mamp, "o", label="M-wave (p-p)")
-    plt.plot(X_fit, Hamp, "o", label="H-reflex (p-p)")
+    plt.plot(X, Mamp, "o", label=("M-wave (P1→N1)" if s.use_m_p1n1 else "M-wave (p-p)"))
+    plt.plot(X, Hamp, "o", label="H-reflex (p-p)")
     plt.xlabel("Stimulation intensity (mV)")
     plt.ylabel("Amplitude (mV)")
     plt.title(f"{os.path.basename(csv_path)}\nSF={sf:.1f} Hz | sweeps={n_sweeps}")
@@ -433,7 +420,7 @@ def run_fit(csv_path: str, s: Settings):
     plt.tight_layout()
     plt.show()
 
-    # --- Save results (MATLAB-style) ---
+    # --- Save results ---
     out_dir = os.path.dirname(os.path.abspath(csv_path))
     txt_path = os.path.join(out_dir, s.results_txt_name)
 
@@ -451,9 +438,10 @@ def run_fit(csv_path: str, s: Settings):
         pd.DataFrame(
             {
                 "sweep": np.arange(1, n_sweeps + 1),
-                "stim_mv": X_raw,
-                "stim_mv_fit_jittered": X_fit,
+                "stim_mv": X,
                 "M_pp_mV": Mamp,
+                "M_method": ("P1N1" if s.use_m_p1n1 else "P2P"),
+                "M_opp_max_ms": (s.m_opposite_max_ms if s.use_m_p1n1 else np.nan),
                 "H_pp_mV": Hamp,
                 "baseline_rms_mV": EMGrms,
             }
@@ -474,9 +462,10 @@ def run_fit(csv_path: str, s: Settings):
         "table": pd.DataFrame(
             {
                 "sweep": np.arange(1, n_sweeps + 1),
-                "stim_mv": X_raw,
-                "stim_mv_fit_jittered": X_fit,
+                "stim_mv": X,
                 "M_pp_mV": Mamp,
+                "M_method": ("P1N1" if s.use_m_p1n1 else "P2P"),
+                "M_opp_max_ms": (s.m_opposite_max_ms if s.use_m_p1n1 else np.nan),
                 "H_pp_mV": Hamp,
                 "baseline_rms_mV": EMGrms,
             }
@@ -506,6 +495,10 @@ def gui():
     rms_w1 = tk.StringVar(value=str(s.rms_start_ms))
     rms_w2 = tk.StringVar(value=str(s.rms_stop_ms))
 
+    # M method option
+    m_p1n1_on = tk.IntVar(value=1 if s.use_m_p1n1 else 0)
+    m_opp_max_var = tk.StringVar(value=str(s.m_opposite_max_ms))
+
     jitter_on = tk.IntVar(value=1 if s.add_x_jitter else 0)
     jitter_sd = tk.StringVar(value=str(s.x_jitter_sd_mv))
 
@@ -513,8 +506,6 @@ def gui():
     h_poly_on = tk.IntVar(value=1 if s.show_h_poly_fit_plot else 0)
     write_txt_on = tk.IntVar(value=1 if s.write_results_txt else 0)
     save_csv_on = tk.IntVar(value=1 if s.save_summary_csv else 0)
-    auto_on = tk.IntVar(value=1 if s.auto_windows else 0)
-
 
     def browse():
         p = filedialog.askopenfilename(
@@ -544,13 +535,14 @@ def gui():
                 h_stop_ms=float(h_w2.get()),
                 rms_start_ms=float(rms_w1.get()),
                 rms_stop_ms=float(rms_w2.get()),
+                use_m_p1n1=bool(m_p1n1_on.get()),
+                m_opposite_max_ms=float(m_opp_max_var.get()),
                 add_x_jitter=bool(jitter_on.get()),
                 x_jitter_sd_mv=float(jitter_sd.get()),
                 show_raw_check_plot=bool(raw_plot_on.get()),
                 show_h_poly_fit_plot=bool(h_poly_on.get()),
                 write_results_txt=bool(write_txt_on.get()),
                 save_summary_csv=bool(save_csv_on.get()),
-                auto_windows=bool(auto_on.get()),
             )
         except Exception as e:
             messagebox.showerror("Error", f"Bad input: {e}")
@@ -620,7 +612,9 @@ def gui():
         tk.Entry(frm, textvariable=b, width=10).grid(row=r, column=2, sticky="w")
         r += 1
 
-    tk.Checkbutton(frm, text="Auto-detect M/H windows", variable=auto_on).grid(row=r, column=0, sticky="w")
+    tk.Checkbutton(frm, text="M: use first peak pair (P1→N1)", variable=m_p1n1_on).grid(row=r, column=0, sticky="w")
+    tk.Label(frm, text="opp max (ms)").grid(row=r, column=1, sticky="e")
+    tk.Entry(frm, textvariable=m_opp_max_var, width=10).grid(row=r, column=2, sticky="w")
     r += 1
 
     tk.Checkbutton(frm, text="Add tiny X jitter", variable=jitter_on).grid(row=r, column=0, sticky="w")
